@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -33,7 +34,23 @@ func TestClusterIngressDefaulting(t *testing.T) {
 	}{{
 		name: "empty",
 		in:   &ClusterIngress{},
-		want: &ClusterIngress{},
+		want: &ClusterIngress{
+			Spec: IngressSpec{
+				Visibility: IngressVisibilityExternalIP,
+			},
+		},
+	}, {
+		name: "has-visibility",
+		in: &ClusterIngress{
+			Spec: IngressSpec{
+				Visibility: IngressVisibilityClusterLocal,
+			},
+		},
+		want: &ClusterIngress{
+			Spec: IngressSpec{
+				Visibility: IngressVisibilityClusterLocal,
+			},
+		},
 	}, {
 		name: "tls-defaulting",
 		in: &ClusterIngress{
@@ -50,9 +67,10 @@ func TestClusterIngressDefaulting(t *testing.T) {
 					SecretNamespace: "secret-space",
 					SecretName:      "secret-name",
 					// Default secret keys are filled in.
-					ServerCertificate: "tls.cert",
+					ServerCertificate: "tls.crt",
 					PrivateKey:        "tls.key",
 				}},
+				Visibility: IngressVisibilityExternalIP,
 			},
 		},
 	}, {
@@ -65,6 +83,7 @@ func TestClusterIngressDefaulting(t *testing.T) {
 					ServerCertificate: "custom.tls.cert",
 					PrivateKey:        "custom.tls.key",
 				}},
+				Visibility: IngressVisibilityExternalIP,
 			},
 		},
 		want: &ClusterIngress{
@@ -76,6 +95,7 @@ func TestClusterIngressDefaulting(t *testing.T) {
 					ServerCertificate: "custom.tls.cert",
 					PrivateKey:        "custom.tls.key",
 				}},
+				Visibility: IngressVisibilityExternalIP,
 			},
 		},
 	}, {
@@ -95,6 +115,7 @@ func TestClusterIngressDefaulting(t *testing.T) {
 						}},
 					},
 				}},
+				Visibility: IngressVisibilityExternalIP,
 			},
 		},
 		want: &ClusterIngress{
@@ -120,6 +141,7 @@ func TestClusterIngressDefaulting(t *testing.T) {
 						}},
 					},
 				}},
+				Visibility: IngressVisibilityExternalIP,
 			},
 		},
 	}, {
@@ -152,6 +174,7 @@ func TestClusterIngressDefaulting(t *testing.T) {
 						}},
 					},
 				}},
+				Visibility: IngressVisibilityExternalIP,
 			},
 		},
 		want: &ClusterIngress{
@@ -185,6 +208,7 @@ func TestClusterIngressDefaulting(t *testing.T) {
 						}},
 					},
 				}},
+				Visibility: IngressVisibilityExternalIP,
 			},
 		},
 	}, {
@@ -216,6 +240,7 @@ func TestClusterIngressDefaulting(t *testing.T) {
 						}},
 					},
 				}},
+				Visibility: IngressVisibilityExternalIP,
 			},
 		},
 		want: &ClusterIngress{
@@ -250,6 +275,7 @@ func TestClusterIngressDefaulting(t *testing.T) {
 						}},
 					},
 				}},
+				Visibility: IngressVisibilityExternalIP,
 			},
 		},
 	}}
@@ -257,7 +283,7 @@ func TestClusterIngressDefaulting(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got := test.in
-			got.SetDefaults()
+			got.SetDefaults(context.Background())
 			if diff := cmp.Diff(test.want, got); diff != "" {
 				t.Errorf("SetDefaults (-want, +got) = %v", diff)
 			}

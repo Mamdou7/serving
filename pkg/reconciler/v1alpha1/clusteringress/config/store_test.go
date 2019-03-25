@@ -26,32 +26,32 @@ import (
 )
 
 func TestStoreLoadWithContext(t *testing.T) {
+	defer ClearAllLoggers()
 	store := NewStore(TestLogger(t))
 
 	istioConfig := ConfigMapFromTestFile(t, IstioConfigName)
 	store.OnConfigChanged(istioConfig)
 	config := FromContext(store.ToContext(context.Background()))
 
-	t.Run("load istio", func(t *testing.T) {
-		expected, _ := NewIstioFromConfigMap(istioConfig)
-		if diff := cmp.Diff(expected, config.Istio); diff != "" {
-			t.Errorf("Unexpected istio config (-want, +got): %v", diff)
-		}
-	})
+	expected, _ := NewIstioFromConfigMap(istioConfig)
+	if diff := cmp.Diff(expected, config.Istio); diff != "" {
+		t.Errorf("Unexpected istio config (-want, +got): %v", diff)
+	}
 }
 
 func TestStoreImmutableConfig(t *testing.T) {
+	defer ClearAllLoggers()
 	store := NewStore(TestLogger(t))
 
 	store.OnConfigChanged(ConfigMapFromTestFile(t, IstioConfigName))
 
 	config := store.Load()
 
-	config.Istio.IngressGateway = "mutated"
+	config.Istio.IngressGateways = []Gateway{{GatewayName: "mutated", ServiceURL: "mutated"}}
 
 	newConfig := store.Load()
 
-	if newConfig.Istio.IngressGateway == "mutated" {
+	if newConfig.Istio.IngressGateways[0].GatewayName == "mutated" {
 		t.Error("Istio config is not immutable")
 	}
 }

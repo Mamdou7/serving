@@ -23,7 +23,7 @@ import (
 	"github.com/knative/serving/pkg/client/clientset/versioned"
 	servingtyped "github.com/knative/serving/pkg/client/clientset/versioned/typed/serving/v1alpha1"
 	testbuildtyped "github.com/knative/serving/test/client/clientset/versioned/typed/testing/v1alpha1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
 	"k8s.io/client-go/rest"
@@ -60,6 +60,10 @@ func NewClients(configPath string, clusterName string, namespace string) (*Clien
 	if err != nil {
 		return nil, err
 	}
+
+	// We poll, so set our limits high.
+	cfg.QPS = 100
+	cfg.Burst = 200
 
 	clients.KubeClient, err = test.NewKubeClient(configPath, clusterName)
 	if err != nil {
@@ -105,13 +109,12 @@ func newServingClients(cfg *rest.Config, namespace string) (*ServingClients, err
 		return nil, err
 	}
 
-	var clients = &ServingClients{}
-	clients.Routes = cs.ServingV1alpha1().Routes(namespace)
-	clients.Configs = cs.ServingV1alpha1().Configurations(namespace)
-	clients.Revisions = cs.ServingV1alpha1().Revisions(namespace)
-	clients.Services = cs.ServingV1alpha1().Services(namespace)
-
-	return clients, nil
+	return &ServingClients{
+		Configs:   cs.ServingV1alpha1().Configurations(namespace),
+		Revisions: cs.ServingV1alpha1().Revisions(namespace),
+		Routes:    cs.ServingV1alpha1().Routes(namespace),
+		Services:  cs.ServingV1alpha1().Services(namespace),
+	}, nil
 }
 
 // Delete will delete all Routes and Configs with the names routes and configs, if clients
@@ -128,6 +131,11 @@ func (clients *ServingClients) Delete(routes []string, configs []string, service
 		{clients.Services, services},
 	}
 
+	propPolicy := v1.DeletePropagationForeground
+	dopt := &v1.DeleteOptions{
+		PropagationPolicy: &propPolicy,
+	}
+
 	for _, deletion := range deletions {
 		if deletion.client == nil {
 			continue
@@ -138,7 +146,7 @@ func (clients *ServingClients) Delete(routes []string, configs []string, service
 				continue
 			}
 
-			if err := deletion.client.Delete(item, nil); err != nil {
+			if err := deletion.client.Delete(item, dopt); err != nil {
 				return err
 			}
 		}

@@ -19,14 +19,16 @@ package resources
 import (
 	"strconv"
 
+	"k8s.io/apimachinery/pkg/util/intstr"
+
 	"github.com/knative/pkg/logging"
+	"github.com/knative/pkg/system"
 	"github.com/knative/serving/pkg/apis/serving/v1alpha1"
 	"github.com/knative/serving/pkg/autoscaler"
 	"github.com/knative/serving/pkg/queue"
 	"github.com/knative/serving/pkg/reconciler/v1alpha1/revision/config"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 var (
@@ -36,27 +38,21 @@ var (
 		},
 	}
 	queuePorts = []corev1.ContainerPort{{
-		Name:          queue.RequestQueuePortName,
-		ContainerPort: int32(queue.RequestQueuePort),
+		Name:          v1alpha1.RequestQueuePortName,
+		ContainerPort: int32(v1alpha1.RequestQueuePort),
 	}, {
 		// Provides health checks and lifecycle hooks.
-		Name:          queue.RequestQueueAdminPortName,
-		ContainerPort: int32(queue.RequestQueueAdminPort),
+		Name:          v1alpha1.RequestQueueAdminPortName,
+		ContainerPort: int32(v1alpha1.RequestQueueAdminPort),
+	}, {
+		Name:          v1alpha1.RequestQueueMetricsPortName,
+		ContainerPort: int32(v1alpha1.RequestQueueMetricsPort),
 	}}
-	// This handler (1) marks the service as not ready and (2)
-	// adds a small delay before the container is killed.
-	queueLifecycle = &corev1.Lifecycle{
-		PreStop: &corev1.Handler{
-			HTTPGet: &corev1.HTTPGetAction{
-				Port: intstr.FromInt(queue.RequestQueueAdminPort),
-				Path: queue.RequestQueueQuitPath,
-			},
-		},
-	}
+
 	queueReadinessProbe = &corev1.Probe{
 		Handler: corev1.Handler{
 			HTTPGet: &corev1.HTTPGetAction{
-				Port: intstr.FromInt(queue.RequestQueueAdminPort),
+				Port: intstr.FromInt(v1alpha1.RequestQueueAdminPort),
 				Path: queue.RequestQueueHealthPath,
 			},
 		},
@@ -65,6 +61,10 @@ var (
 		// bit more often than the default.  It is a small
 		// sacrifice for a low rate of 503s.
 		PeriodSeconds: 1,
+		// We keep the connection open for a while because we're
+		// actively probing the user-container on that endpoint and
+		// thus don't want to be limited by K8s granularity here.
+		TimeoutSeconds: 10,
 	}
 )
 
@@ -77,6 +77,7 @@ func makeQueueContainer(rev *v1alpha1.Revision, loggingConfig *logging.Config, a
 	}
 
 	autoscalerAddress := "autoscaler"
+	userPort := getUserPort(rev)
 
 	var loggingLevel string
 	if ll, ok := loggingConfig.LoggingLevel["queueproxy"]; ok {
@@ -84,11 +85,10 @@ func makeQueueContainer(rev *v1alpha1.Revision, loggingConfig *logging.Config, a
 	}
 
 	return &corev1.Container{
-		Name:           queueContainerName,
+		Name:           QueueContainerName,
 		Image:          controllerConfig.QueueSidecarImage,
 		Resources:      queueResources,
 		Ports:          queuePorts,
-		Lifecycle:      queueLifecycle,
 		ReadinessProbe: queueReadinessProbe,
 		Env: []corev1.EnvVar{{
 			Name:  "SERVING_NAMESPACE",
@@ -110,7 +110,7 @@ func makeQueueContainer(rev *v1alpha1.Revision, loggingConfig *logging.Config, a
 			Value: strconv.Itoa(int(rev.Spec.ContainerConcurrency)),
 		}, {
 			Name:  "REVISION_TIMEOUT_SECONDS",
-			Value: strconv.Itoa(int(rev.Spec.TimeoutSeconds.Duration.Seconds())),
+			Value: strconv.Itoa(int(rev.Spec.TimeoutSeconds)),
 		}, {
 			Name: "SERVING_POD",
 			ValueFrom: &corev1.EnvVarSource{
@@ -124,6 +124,12 @@ func makeQueueContainer(rev *v1alpha1.Revision, loggingConfig *logging.Config, a
 		}, {
 			Name:  "SERVING_LOGGING_LEVEL",
 			Value: loggingLevel,
+		}, {
+			Name:  "USER_PORT",
+			Value: strconv.Itoa(int(userPort)),
+		}, {
+			Name:  system.NamespaceEnvKey,
+			Value: system.Namespace(),
 		}},
 	}
 }

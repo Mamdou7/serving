@@ -19,394 +19,521 @@ limitations under the License.
 package conformance
 
 import (
-	"context"
 	"fmt"
-	"math"
-	"net/http"
+	"strconv"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	pkgTest "github.com/knative/pkg/test"
-	"github.com/knative/pkg/test/logging"
 	"github.com/knative/serving/pkg/apis/serving/v1alpha1"
-	serviceresourcenames "github.com/knative/serving/pkg/reconciler/v1alpha1/service/resources/names"
 	"github.com/knative/serving/test"
-	"golang.org/x/sync/errgroup"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-const (
-	expectedLatest = "Hello World! How about some tasty noodles?"
-)
+const userPort = int32(8081)
 
-func waitForExpected(logger *logging.BaseLogger, clients *test.Clients, domain, expected string) error {
-	client, err := pkgTest.NewSpoofingClient(clients.KubeClient, logger, domain, test.ServingFlags.ResolvableDomain)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://%s", domain), nil)
-	if err != nil {
-		return err
-	}
-	_, err = client.Poll(req, pkgTest.EventuallyMatchesBody(expected))
-	return err
-}
-
-func validateDomains(t *testing.T, logger *logging.BaseLogger, clients *test.Clients, baseDomain string, baseExpected, trafficTargets, targetsExpected []string) {
-	var subdomains []string
-	for _, target := range trafficTargets {
-		subdomains = append(subdomains, fmt.Sprintf("%s.%s", target, baseDomain))
-	}
-
-	// We don't have a good way to check if the route is updated so we will wait until a subdomain has
-	// started returning at least one expected result to key that we should validate percentage splits.
-	logger.Infof("Waiting for route to update domain: %s", subdomains[0])
-	err := waitForExpected(logger, clients, subdomains[0], targetsExpected[0])
-	if err != nil {
-		t.Fatalf("Error waiting for route to update %s: %v", subdomains[0], targetsExpected[0])
-	}
-
-	g, _ := errgroup.WithContext(context.Background())
-	var minBasePercentage float64
-	if len(baseExpected) == 1 {
-		minBasePercentage = minDirectPercentage
-	} else {
-		minBasePercentage = minSplitPercentage
-	}
-	g.Go(func() error {
-		min := int(math.Floor(concurrentRequests * minBasePercentage))
-		return checkDistribution(logger, clients, baseDomain, concurrentRequests, min, baseExpected)
-	})
-	if err := g.Wait(); err != nil {
-		t.Fatalf("Error sending requests: %v", err)
-	}
-	for i, subdomain := range subdomains {
-		g.Go(func() error {
-			min := int(math.Floor(concurrentRequests * minDirectPercentage))
-			return checkDistribution(logger, clients, subdomain, concurrentRequests, min, []string{targetsExpected[i]})
-		})
-		// Wait before going to the next domain as to not mutate subdomain and i
-		if err := g.Wait(); err != nil {
-			t.Fatalf("Error sending requests: %v", err)
+// Validates the state of Configuration, Revision, and Route objects for a runLatest Service. The checks in this method should be able to be performed at any point in a
+// runLatest Service's lifecycle so long as the service is in a "Ready" state.
+func validateRunLatestControlPlane(t *testing.T, clients *test.Clients, names test.ResourceNames, expectedGeneration string) error {
+	t.Log("Checking to ensure Revision is in desired state with generation: ", expectedGeneration)
+	err := test.CheckRevisionState(clients.ServingClient, names.Revision, func(r *v1alpha1.Revision) (bool, error) {
+		if ready, err := test.IsRevisionReady(r); !ready {
+			return false, fmt.Errorf("revision %s did not become ready to serve traffic: %v", names.Revision, err)
 		}
+		if r.Status.ImageDigest == "" {
+			return false, fmt.Errorf("imageDigest not present for revision %s", names.Revision)
+		}
+		if validDigest, err := validateImageDigest(names.Image, r.Status.ImageDigest); !validDigest {
+			return false, fmt.Errorf("imageDigest %s is not valid for imageName %s: %v", r.Status.ImageDigest, names.Image, err)
+		}
+		return true, nil
+	})
+	if err != nil {
+		return err
+	}
+	err = test.CheckRevisionState(clients.ServingClient, names.Revision, test.IsRevisionAtExpectedGeneration(expectedGeneration))
+	if err != nil {
+		return fmt.Errorf("revision %s did not have an expected annotation with generation %s: %v", names.Revision, expectedGeneration, err)
 	}
 
+	t.Log("Checking to ensure Configuration is in desired state.")
+	err = test.CheckConfigurationState(clients.ServingClient, names.Config, func(c *v1alpha1.Configuration) (bool, error) {
+		if c.Status.LatestCreatedRevisionName != names.Revision {
+			return false, fmt.Errorf("the Configuration %s was not updated indicating that the Revision %s was created: %v", names.Config, names.Revision, err)
+		}
+		if c.Status.LatestReadyRevisionName != names.Revision {
+			return false, fmt.Errorf("the Configuration %s was not updated indicating that the Revision %s was ready: %v", names.Config, names.Revision, err)
+		}
+		return true, nil
+	})
+	if err != nil {
+		return err
+	}
+
+	t.Log("Checking to ensure Route is in desired state with generation: ", expectedGeneration)
+	err = test.CheckRouteState(clients.ServingClient, names.Route, test.AllRouteTrafficAtRevision(names))
+	if err != nil {
+		return fmt.Errorf("the Route %s was not updated to route traffic to the Revision %s: %v", names.Route, names.Revision, err)
+	}
+
+	return nil
 }
 
-// Shamelessly cribbed from route_test. We expect the Route and Configuration to be ready if the Service is ready.
-func assertServiceResourcesUpdated(t *testing.T, logger *logging.BaseLogger, clients *test.Clients, names test.ResourceNames, routeDomain, expectedGeneration, expectedText string) {
-	// TODO(#1178): Remove "Wait" from all checks below this point.
+// Validates service health and vended content match for a runLatest Service. The checks in this method should be able to be performed at any point in a
+// runLatest Service's lifecycle so long as the service is in a "Ready" state.
+func validateRunLatestDataPlane(t *testing.T, clients *test.Clients, names test.ResourceNames, expectedText string) error {
+	t.Logf("Checking that the endpoint vends the expected text: %s", expectedText)
 	_, err := pkgTest.WaitForEndpointState(
 		clients.KubeClient,
-		logger,
-		routeDomain,
-		pkgTest.Retrying(pkgTest.EventuallyMatchesBody(expectedText), http.StatusNotFound),
+		t.Logf,
+		names.Domain,
+		test.RetryingRouteInconsistency(pkgTest.MatchesAllOf(pkgTest.IsStatusOK, pkgTest.EventuallyMatchesBody(expectedText))),
 		"WaitForEndpointToServeText",
 		test.ServingFlags.ResolvableDomain)
 	if err != nil {
-		t.Fatalf("The endpoint for Route %s at domain %s didn't serve the expected text \"%s\": %v", names.Route, routeDomain, expectedText, err)
+		return fmt.Errorf("the endpoint for Route %s at domain %s didn't serve the expected text \"%s\": %v", names.Route, names.Domain, expectedText, err)
 	}
 
-	// We want to verify that the endpoint works as soon as Ready: True, but there are a bunch of other pieces of state that we validate for conformance.
-	logger.Info("The Revision will be marked as Ready when it can serve traffic")
-	if err := test.CheckRevisionState(clients.ServingClient, names.Revision, test.IsRevisionReady); err != nil {
-		t.Fatalf("Revision %s did not become ready to serve traffic: %v", names.Revision, err)
-	}
-	logger.Infof("The Revision will be annotated with the generation")
-	err = test.CheckRevisionState(clients.ServingClient, names.Revision, test.IsRevisionAtExpectedGeneration(expectedGeneration))
-	if err != nil {
-		t.Fatalf("Revision %s did not have an expected annotation with generation %s: %v", names.Revision, expectedGeneration, err)
-	}
-	logger.Info("The Service's latestReadyRevisionName should match the Configuration's")
-	err = test.CheckConfigurationState(clients.ServingClient, names.Config, func(c *v1alpha1.Configuration) (bool, error) {
-		return c.Status.LatestReadyRevisionName == names.Revision, nil
-	})
-	if err != nil {
-		t.Fatalf("The Configuration %s was not updated indicating that the Revision %s was ready: %v\n", names.Config, names.Revision, err)
-	}
-
-	logger.Info("Updates the Route to route traffic to the Revision")
-	if err := test.CheckRouteState(clients.ServingClient, names.Route, test.AllRouteTrafficAtRevision(names)); err != nil {
-		t.Fatalf("The Route %s was not updated to route traffic to the Revision %s: %v", names.Route, names.Revision, err)
-	}
-
-	logger.Infof("TODO: The Service's Route is accessible from inside the cluster without external DNS")
+	t.Log("TODO: The Service's Route is accessible from inside the cluster without external DNS")
 	err = test.CheckServiceState(clients.ServingClient, names.Service, test.TODO_ServiceTrafficToRevisionWithInClusterDNS)
 	if err != nil {
-		t.Fatalf("The Service %s was not able to route traffic to the Revision %s with in cluster DNS: %v", names.Service, names.Revision, err)
+		return fmt.Errorf("the Service %s was not able to route traffic to the Revision %s with in cluster DNS: %v", names.Service, names.Revision, err)
 	}
 
-	// TODO(#1381): Check labels and annotations.
+	return nil
+
 }
 
-func waitForServiceLatestCreatedRevision(clients *test.Clients, names test.ResourceNames) (string, error) {
-	var revisionName string
-	err := test.WaitForServiceState(clients.ServingClient, names.Service, func(s *v1alpha1.Service) (bool, error) {
-		if s.Status.LatestCreatedRevisionName != names.Revision {
-			revisionName = s.Status.LatestCreatedRevisionName
-			return true, nil
+// Validates labels on Revision, Configuration, and Route objects when created by a Service
+// see spec here: https://github.com/knative/serving/blob/master/docs/spec/spec.md#revision
+func validateLabelsPropagation(t *testing.T, objects test.ResourceObjects, names test.ResourceNames) error {
+	t.Log("Validate Labels on Revision Object")
+	revision := objects.Revision
+
+	if revision.Labels["serving.knative.dev/configuration"] != names.Config {
+		return fmt.Errorf("expect Confguration name in Revision label %q but got %q ", names.Config, revision.Labels["serving.knative.dev/configuration"])
+	}
+	if revision.Labels["serving.knative.dev/service"] != names.Service {
+		return fmt.Errorf("expect Service name in Revision label %q but got %q ", names.Service, revision.Labels["serving.knative.dev/service"])
+	}
+
+	t.Log("Validate Labels on Configuration Object")
+	config := objects.Config
+	if config.Labels["serving.knative.dev/service"] != names.Service {
+		return fmt.Errorf("expect Service name in Configuration label %q but got %q ", names.Service, config.Labels["serving.knative.dev/service"])
+	}
+	if config.Labels["serving.knative.dev/route"] != names.Route {
+		return fmt.Errorf("expect Route name in Configuration label %q but got %q ", names.Route, config.Labels["serving.knative.dev/route"])
+	}
+
+	t.Log("Validate Labels on Route Object")
+	route := objects.Route
+	if route.Labels["serving.knative.dev/service"] != names.Service {
+		return fmt.Errorf("expect Service name in Route label %q but got %q ", names.Service, route.Labels["serving.knative.dev/service"])
+	}
+	return nil
+}
+
+func validateAnnotations(objs *test.ResourceObjects) error {
+	// This checks whether the annotations are set on the resources that
+	// expect them to have.
+	// List of issues listing annotations that we check: #1642.
+
+	anns := objs.Service.GetAnnotations()
+	for _, a := range []string{v1alpha1.CreatorAnnotation, v1alpha1.UpdaterAnnotation} {
+		if got := anns[a]; got == "" {
+			return fmt.Errorf("Expected %s annotation to be set, but was empty", a)
 		}
-		return false, nil
-	}, "ServiceUpdatedWithRevision")
-	return revisionName, err
+	}
+	return nil
 }
 
-func waitForServiceDomain(clients *test.Clients, names test.ResourceNames) (string, error) {
-	var routeDomain string
-	err := test.WaitForServiceState(clients.ServingClient, names.Service, func(s *v1alpha1.Service) (bool, error) {
-		if s.Status.Domain != "" {
-			routeDomain = s.Status.Domain
-			return true, nil
-		}
-		return false, nil
-	}, "ServiceUpdatedWithDomain")
-	return routeDomain, err
+func validateReleaseServiceShape(objs *test.ResourceObjects) error {
+	// Check that Spec.Revisions is as expected.
+	if got, want := objs.Service.Spec.Release.Revisions, []string{v1alpha1.ReleaseLatestRevisionKeyword}; !cmp.Equal(got, want) {
+		return fmt.Errorf("Spec.Release.Revisions mismatch: diff: %s", cmp.Diff(got, want))
+	}
+	// Traffic should be routed to the lastest created revision.
+	if got, want := objs.Service.Status.Traffic[0].RevisionName, objs.Config.Status.LatestReadyRevisionName; got != want {
+		return fmt.Errorf("Status.Traffic[0].RevisionsName = %s, want: %s", got, want)
+	}
+	return nil
 }
 
+// TestRunLatestService tests both Creation and Update paths of a runLatest service. The test performs a series of Update/Validate steps to ensure that
+// the service transitions as expected during each step.
+// Currently the test performs the following updates:
+// 1. Update Container Image
+// 2. Update Metadata
+//    a. Update Labels
+//    b. Update Annotations
+// 3. Update UserPort
 func TestRunLatestService(t *testing.T) {
+	t.Parallel()
 	clients := setup(t)
 
-	// Add test case specific name to its own logger.
-	logger := logging.GetContextLogger("TestRunLatestService")
+	names := test.ResourceNames{
+		Service: test.ObjectNameForTest(t),
+		Image:   pizzaPlanet1,
+	}
 
-	var imagePaths []string
-	imagePaths = append(imagePaths, test.ImagePath(pizzaPlanet1))
-	imagePaths = append(imagePaths, test.ImagePath(pizzaPlanet2))
+	// Clean up on test failure or interrupt
+	defer test.TearDown(clients, names)
+	test.CleanupOnInterrupt(func() { test.TearDown(clients, names) })
 
-	var names test.ResourceNames
-	names.Service = test.AppendRandomString("pizzaplanet-service", logger)
-
-	defer tearDown(clients, names)
-	test.CleanupOnInterrupt(func() { tearDown(clients, names) }, logger)
-
-	logger.Info("Creating a new Service")
-	svc, err := test.CreateLatestService(logger, clients, names, imagePaths[0])
+	// Setup initial Service
+	objects, err := test.CreateRunLatestServiceReady(t, clients, &names, &test.Options{})
 	if err != nil {
-		t.Fatalf("Failed to create Service: %v", err)
-	}
-	names.Route = serviceresourcenames.Route(svc)
-	names.Config = serviceresourcenames.Configuration(svc)
-
-	logger.Info("The Service will be updated with the name of the Revision once it is created")
-	revisionName, err := waitForServiceLatestCreatedRevision(clients, names)
-	if err != nil {
-		t.Fatalf("Service %s was not updated with the new revision: %v", names.Service, err)
-	}
-	names.Revision = revisionName
-
-	logger.Info("The Service will be updated with the domain of the Route once it is created")
-	routeDomain, err := waitForServiceDomain(clients, names)
-	if err != nil {
-		t.Fatalf("Service %s was not updated with the new route: %v", names.Service, err)
+		t.Fatalf("Failed to create initial Service %v: %v", names.Service, err)
 	}
 
-	logger.Info("When the Service reports as Ready, everything should be ready.")
-	if err := test.WaitForServiceState(clients.ServingClient, names.Service, test.IsServiceReady, "ServiceIsReady"); err != nil {
-		t.Fatalf("The Service %s was not marked as Ready to serve traffic to Revision %s: %v", names.Service, names.Revision, err)
+	// Validate State after Creation
+
+	if err = validateRunLatestControlPlane(t, clients, names, "1"); err != nil {
+		t.Error(err)
 	}
-	assertServiceResourcesUpdated(t, logger, clients, names, routeDomain, "1", "What a spaceport!")
+
+	if err = validateRunLatestDataPlane(t, clients, names, pizzaPlanetText1); err != nil {
+		t.Error(err)
+	}
+
+	if err = validateLabelsPropagation(t, *objects, names); err != nil {
+		t.Error(err)
+	}
+
+	if err := validateAnnotations(objects); err != nil {
+		t.Errorf("Service annotations are incorrect: %v", err)
+	}
 
 	// We start a background prober to test if Route is always healthy even during Route update.
-	routeProberErrorChan := test.RunRouteProber(logger, clients, routeDomain)
+	prober := test.RunRouteProber(t, clients, names.Domain)
+	defer test.AssertProberDefault(t, prober)
 
-	logger.Info("Updating the Service to use a different image")
-	if _, err := test.UpdateServiceImage(clients, svc, imagePaths[1]); err != nil {
-		t.Fatalf("Patch update for Service %s with new image %s failed: %v", names.Service, imagePaths[1], err)
+	// Update Container Image
+	t.Log("Updating the Service to use a different image.")
+	names.Image = printport
+	image2 := pkgTest.ImagePath(names.Image)
+	if _, err := test.PatchServiceImage(t, clients, objects.Service, image2); err != nil {
+		t.Fatalf("Patch update for Service %s with new image %s failed: %v", names.Service, image2, err)
 	}
 
-	logger.Info("Since the Service was updated a new Revision will be created and the Service will be updated")
-	revisionName, err = waitForServiceLatestCreatedRevision(clients, names)
+	t.Log("Service should reflect new revision created and ready in status.")
+	names.Revision, err = test.WaitForServiceLatestRevision(clients, names)
 	if err != nil {
-		t.Fatalf("Service %s was not updated with the Revision for image %s: %v", names.Service, pizzaPlanet2, err)
+		t.Fatalf("New image not reflected in Service: %v", err)
 	}
-	names.Revision = revisionName
 
-	logger.Info("When the Service reports as Ready, everything should be ready.")
+	t.Log("Waiting for Service to transition to Ready.")
 	if err := test.WaitForServiceState(clients.ServingClient, names.Service, test.IsServiceReady, "ServiceIsReady"); err != nil {
-		t.Fatalf("The Service %s was not marked as Ready to serve traffic to Revision %s: %v", names.Service, names.Revision, err)
-	}
-	assertServiceResourcesUpdated(t, logger, clients, names, routeDomain, "2", "Re-energize yourself with a slice of pepperoni!")
-
-	if err := test.GetRouteProberError(routeProberErrorChan, logger); err != nil {
-		// Currently the Route prober is flaky. So we just log the error here for future debugging instead of
-		// failing the test.
-		t.Fatalf("Route prober failed with error %s", err)
-	}
-}
-
-func TestUpdateRevisionTemplateSpecMetadata(t *testing.T) {
-	clients := setup(t)
-
-	logger := logging.GetContextLogger("TestUpdateRevisionTemplateSpecMetadata")
-
-	var names test.ResourceNames
-	names.Service = test.AppendRandomString("pizzaplanet-service", logger)
-
-	defer tearDown(clients, names)
-	test.CleanupOnInterrupt(func() { tearDown(clients, names) }, logger)
-
-	logger.Info("Creating a new Service")
-	svc, err := test.CreateLatestService(logger, clients, names, test.ImagePath(pizzaPlanet1))
-	if err != nil {
-		t.Fatalf("Failed to create Service: %v", err)
-	}
-	names.Route = serviceresourcenames.Route(svc)
-	names.Config = serviceresourcenames.Configuration(svc)
-
-	logger.Info("The Service will be updated with the name of the Revision once it is created")
-	names.Revision, err = waitForServiceLatestCreatedRevision(clients, names)
-	if err != nil {
-		t.Fatalf("Service %s was not updated with the new revision: %v", names.Service, err)
+		t.Fatalf("Error waiting for the service to become ready for the latest revision: %v", err)
 	}
 
-	logger.Info("Updating labels of the RevisionTemplateSpec for service %s", names.Service)
+	// Validate State after Image Update
+	if err = validateRunLatestControlPlane(t, clients, names, "2"); err != nil {
+		t.Error(err)
+	}
+	if err = validateRunLatestDataPlane(t, clients, names, strconv.Itoa(v1alpha1.DefaultUserPort)); err != nil {
+		t.Error(err)
+	}
+
+	// Update Metadata (Labels)
+	t.Logf("Updating labels of the RevisionTemplateSpec for service %s.", names.Service)
 	metadata := metav1.ObjectMeta{
 		Labels: map[string]string{
 			"labelX": "abc",
 			"labelY": "def",
 		},
 	}
-	svc, err = test.UpdateServiceRevisionTemplateMetadata(logger, clients, svc, metadata)
-	if err != nil {
+	if objects.Service, err = test.PatchServiceRevisionTemplateMetadata(t, clients, objects.Service, metadata); err != nil {
 		t.Fatalf("Service %s was not updated with labels in its RevisionTemplateSpec: %v", names.Service, err)
 	}
 
-	names.Revision, err = waitForServiceLatestCreatedRevision(clients, names)
-	if err != nil {
-		t.Fatalf("Service %s was not updated with new a new revision after updating labels in its RevisionTemplateSpec: %v", names.Service, err)
+	t.Log("Waiting for the new revision to appear as LatestRevision.")
+	if names.Revision, err = test.WaitForServiceLatestRevision(clients, names); err != nil {
+		t.Fatalf("The Service %s was not updated with new revision %s after updating labels in its RevisionTemplateSpec: %v", names.Service, names.Revision, err)
 	}
 
-	logger.Infof("Updating annotations of RevisionTemplateSpec for service %s", names.Service)
+	// Update Metadata (Annotations)
+	t.Logf("Updating annotations of RevisionTemplateSpec for service %s", names.Service)
 	metadata = metav1.ObjectMeta{
 		Annotations: map[string]string{
 			"annotationA": "123",
 			"annotationB": "456",
 		},
 	}
-	svc, err = test.UpdateServiceRevisionTemplateMetadata(logger, clients, svc, metadata)
-	if err != nil {
+	if objects.Service, err = test.PatchServiceRevisionTemplateMetadata(t, clients, objects.Service, metadata); err != nil {
 		t.Fatalf("Service %s was not updated with annotation in its RevisionTemplateSpec: %v", names.Service, err)
 	}
 
-	names.Revision, err = waitForServiceLatestCreatedRevision(clients, names)
+	t.Log("Waiting for the new revision to appear as LatestRevision.")
+	names.Revision, err = test.WaitForServiceLatestRevision(clients, names)
 	if err != nil {
-		t.Fatalf("Service %s was not updated with new a new revision after updating annotations in its RevisionTemplateSpec: %v", names.Service, err)
+		t.Fatalf("The new revision has not become ready in Service: %v", err)
 	}
 
-	routeDomain, err := waitForServiceDomain(clients, names)
-	if err != nil {
-		t.Fatalf("Service %s was not updated with the new route: %v", names.Service, err)
-	}
-
-	logger.Info("When the Service reports as Ready, everything should be ready.")
+	t.Log("Waiting for Service to transition to Ready.")
 	if err := test.WaitForServiceState(clients.ServingClient, names.Service, test.IsServiceReady, "ServiceIsReady"); err != nil {
-		t.Fatalf("The Service %s was not marked as Ready to serve traffic to Revision %s: %v", names.Service, names.Revision, err)
+		t.Fatalf("Error waiting for the service to become ready for the latest revision: %v", err)
 	}
-	assertServiceResourcesUpdated(t, logger, clients, names, routeDomain, "3", "What a spaceport!")
+
+	// Validate the Service shape.
+	if err = validateRunLatestControlPlane(t, clients, names, "4"); err != nil {
+		t.Error(err)
+	}
+	if err = validateRunLatestDataPlane(t, clients, names, strconv.Itoa(v1alpha1.DefaultUserPort)); err != nil {
+		t.Error(err)
+	}
+
+	// Update container with user port.
+	t.Logf("Updating the port of the user container for service %s to %d", names.Service, userPort)
+	desiredSvc := objects.Service.DeepCopy()
+	desiredSvc.Spec.RunLatest.Configuration.RevisionTemplate.Spec.Container.Ports = []corev1.ContainerPort{{
+		ContainerPort: userPort,
+	}}
+	if objects.Service, err = test.PatchService(t, clients, objects.Service, desiredSvc); err != nil {
+		t.Fatalf("Service %s was not updated with a new port for the user container: %v", names.Service, err)
+	}
+
+	t.Log("Waiting for the new revision to appear as LatestRevision.")
+	if names.Revision, err = test.WaitForServiceLatestRevision(clients, names); err != nil {
+		t.Fatalf("The new revision has not become ready in Service: %v", err)
+	}
+
+	t.Log("Waiting for Service to transition to Ready.")
+	if err := test.WaitForServiceState(clients.ServingClient, names.Service, test.IsServiceReady, "ServiceIsReady"); err != nil {
+		t.Fatalf("Error waiting for the service to become ready for the latest revision: %v", err)
+	}
+
+	// Validate Service
+	if err = validateRunLatestControlPlane(t, clients, names, "5"); err != nil {
+		t.Error(err)
+	}
+
+	if err = validateRunLatestDataPlane(t, clients, names, strconv.Itoa(int(userPort))); err != nil {
+		t.Error(err)
+	}
 }
 
+func waitForDesiredTrafficShape(t *testing.T, sName string, want map[string]v1alpha1.TrafficTarget, clients *test.Clients) error {
+	return test.WaitForServiceState(
+		clients.ServingClient, sName, func(s *v1alpha1.Service) (bool, error) {
+			// IsServiceReady never returns an error.
+			if ok, _ := test.IsServiceReady(s); !ok {
+				return false, nil
+			}
+			// Match the traffic shape.
+			got := map[string]v1alpha1.TrafficTarget{}
+			for _, tt := range s.Status.Traffic {
+				got[tt.Name] = tt
+			}
+			if !cmp.Equal(got, want) {
+				t.Logf("For service %s traffic shape mismatch: (-got, +want) %s", sName, cmp.Diff(got, want))
+				return false, nil
+			}
+			return true, nil
+		}, "Verify Service Traffic Shape",
+	)
+}
+
+// TestReleaseService creates a Service in `release` mode with the only revision
+// being `@latest`. Once this succeeded, the test goes through Update/Validate to
+// try different possible configurations for a release service.
+// Currently tests for the following combinations:
+// 1. One Revision Specified, current == latest
+// 2. One Revision Specified, current != latset
+// 3. Two Revisions Specified, 50% rollout,  candidate == latest
+// 4. Two Revisions Specified, 50% rollout, candidate != latest
+// 5. Two Revisions Specified, 50% rollout, candidate != latest, latest referred to as `@latest`.
 func TestReleaseService(t *testing.T) {
+	t.Parallel()
+	// Create Initial Service
 	clients := setup(t)
-	logger := logging.GetContextLogger("TestReleaseService")
-	releaseImagePath1 := test.ImagePath(pizzaPlanet1)
-	releaseImagePath2 := test.ImagePath(pizzaPlanet2)
-	releaseImagePath3 := test.ImagePath(helloworld)
-
+	releaseImagePath2 := pkgTest.ImagePath(pizzaPlanet2)
+	releaseImagePath3 := pkgTest.ImagePath(helloworld)
 	names := test.ResourceNames{
-		Service: test.AppendRandomString("pizzaplanet-service", logger),
+		Service: test.ObjectNameForTest(t),
+		Image:   pizzaPlanet1,
 	}
+	defer test.TearDown(clients, names)
+	test.CleanupOnInterrupt(func() { test.TearDown(clients, names) })
 
-	defer tearDown(clients, names)
-	test.CleanupOnInterrupt(func() { tearDown(clients, names) }, logger)
+	// Expected Text for different revisions.
+	const (
+		expectedFirstRev  = pizzaPlanetText1
+		expectedSecondRev = pizzaPlanetText2
+		expectedThirdRev  = helloWorldText
+	)
 
-	logger.Info("Creating a new Service in runLatest")
-	svc, err := test.CreateLatestService(logger, clients, names, releaseImagePath1)
+	objects, err := test.CreateReleaseServiceWithLatest(t, clients, &names, &test.Options{})
 	if err != nil {
-		t.Fatalf("Failed to create Service: %v", err)
-	}
-	names.Route = serviceresourcenames.Route(svc)
-	names.Config = serviceresourcenames.Configuration(svc)
-
-	logger.Info("The Service will be updated with the name of the Revision once it is created")
-	revisionName, err := waitForServiceLatestCreatedRevision(clients, names)
-	if err != nil {
-		t.Fatalf("Service %s was not updated with the new revision: %v", names.Service, err)
-	}
-	names.Revision = revisionName
-	firstRevision := revisionName
-
-	logger.Info("The Service will be updated with the domain of the Route once it is created")
-	routeDomain, err := waitForServiceDomain(clients, names)
-	if err != nil {
-		t.Fatalf("Service %s was not updated with the new route: %v", names.Service, err)
+		t.Fatalf("Failed to create initial Service %v: %v", names.Service, err)
 	}
 
-	logger.Info("When the Service reports as Ready, everything should be ready")
-	if err := test.WaitForServiceState(clients.ServingClient, names.Service, test.IsServiceReady, "ServiceIsReady"); err != nil {
-		t.Fatalf("The Service %s was not marked as Ready to serve traffic to Revision %s: %v", names.Service, names.Revision, err)
+	t.Log("Validating service shape.")
+	if err := validateReleaseServiceShape(objects); err != nil {
+		t.Fatalf("Release shape is incorrect: %v", err)
 	}
-	assertServiceResourcesUpdated(t, logger, clients, names, routeDomain, "1", "What a spaceport!")
+	if err := validateAnnotations(objects); err != nil {
+		t.Errorf("Service annotations are incorrect: %v", err)
+	}
+	revisions := []string{names.Revision}
 
-	// Everything above here is setup to get us into a good state to test release mode
-	logger.Info("Updating Service to ReleaseType using lastCreatedRevision")
-	svc, err = test.UpdateReleaseService(logger, clients, svc, []string{firstRevision}, 0)
+	// 1. One Revision Specified, current == latest.
+	t.Log("1. Updating Service to ReleaseType using lastCreatedRevision")
+	objects.Service, err = test.PatchReleaseService(t, clients, objects.Service, revisions, 0)
 	if err != nil {
 		t.Fatalf("Service %s was not updated to release: %v", names.Service, err)
 	}
+	desiredTrafficShape := map[string]v1alpha1.TrafficTarget{
+		v1alpha1.CurrentTrafficTarget: {
+			Name:         v1alpha1.CurrentTrafficTarget,
+			RevisionName: objects.Config.Status.LatestReadyRevisionName,
+			Percent:      100,
+		},
+		v1alpha1.LatestTrafficTarget: {
+			Name:         v1alpha1.LatestTrafficTarget,
+			RevisionName: objects.Config.Status.LatestReadyRevisionName,
+		},
+	}
+	t.Log("Waiting for Service to become ready with the new shape.")
+	if err := waitForDesiredTrafficShape(t, names.Service, desiredTrafficShape, clients); err != nil {
+		t.Fatal("Service never obtained expected shape")
+	}
 
-	logger.Info("Service traffic should go to the first revision and be available on two names traffic targets, 'current' and 'latest'")
-	validateDomains(t, logger, clients,
-		routeDomain,
-		[]string{expectedBlue},
-		[]string{"latest", "current"},
-		[]string{expectedBlue, expectedBlue})
+	t.Log("Service traffic should go to the first revision and be available on two names traffic targets: 'current' and 'latest'")
+	if err := validateDomains(t, clients,
+		names.Domain,
+		[]string{expectedFirstRev},
+		[]string{v1alpha1.LatestTrafficTarget, v1alpha1.CurrentTrafficTarget},
+		[]string{expectedFirstRev, expectedFirstRev}); err != nil {
+		t.Fatal(err)
+	}
 
-	logger.Info("Updating the Service Spec with a new image")
-	if _, err := test.UpdateServiceImage(clients, svc, releaseImagePath2); err != nil {
+	// 2. One Revision Specified, current != latest.
+	t.Log("2. Updating the Service Spec with a new image")
+	if _, err := test.PatchServiceImage(t, clients, objects.Service, releaseImagePath2); err != nil {
 		t.Fatalf("Patch update for Service %s with new image %s failed: %v", names.Service, releaseImagePath2, err)
 	}
 
-	logger.Info("Since the Service was updated a new Revision will be created")
-	revisionName, err = waitForServiceLatestCreatedRevision(clients, names)
-	if err != nil {
-		t.Fatalf("Service %s was not updated with the Revision for image %s: %v", names.Service, releaseImagePath2, err)
+	t.Log("Since the Service was updated a new Revision will be created")
+	if names.Revision, err = test.WaitForServiceLatestRevision(clients, names); err != nil {
+		t.Fatalf("The Service %s was not updated with new revision %s: %v", names.Service, names.Revision, err)
 	}
-	names.Revision = revisionName
-	secondRevision := revisionName
+	revisions = append(revisions, names.Revision)
 
-	logger.Info("Since the Service is using release the Route will not be updated, but new revision will be available at 'latest'")
-	validateDomains(t, logger, clients,
-		routeDomain,
-		[]string{expectedBlue},
-		[]string{"latest", "current"},
-		[]string{expectedGreen, expectedBlue})
+	// Also verify traffic is in the correct shape.
+	desiredTrafficShape[v1alpha1.LatestTrafficTarget] = v1alpha1.TrafficTarget{
+		Name:         v1alpha1.LatestTrafficTarget,
+		RevisionName: names.Revision,
+	}
+	t.Log("Waiting for Service to become ready with the new shape.")
+	if err := waitForDesiredTrafficShape(t, names.Service, desiredTrafficShape, clients); err != nil {
+		t.Fatal("Service never obtained expected shape")
+	}
 
-	logger.Info("Updating Service to split traffic between two revisions using Release mode")
-	svc, err = test.UpdateReleaseService(logger, clients, svc, []string{firstRevision, secondRevision}, 50)
-	if err != nil {
+	t.Log("Since the Service is using release the Route will not be updated, but new revision will be available at 'latest'")
+	if err := validateDomains(t, clients,
+		names.Domain,
+		[]string{expectedFirstRev},
+		[]string{v1alpha1.LatestTrafficTarget, v1alpha1.CurrentTrafficTarget},
+		[]string{expectedSecondRev, expectedFirstRev}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Two Revisions Specified, 50% rollout, candidate == latest.
+	t.Log("3. Updating Service to split traffic between two revisions using Release mode")
+	if objects.Service, err = test.PatchReleaseService(t, clients, objects.Service, revisions, 50); err != nil {
 		t.Fatalf("Service %s was not updated to release: %v", names.Service, err)
 	}
 
-	logger.Info("Traffic should be split between the two revisions and available on three named traffic targets, 'current', 'candidate', and 'latest'")
-	validateDomains(t, logger, clients,
-		routeDomain,
-		[]string{expectedBlue, expectedGreen},
-		[]string{"candidate", "latest", "current"},
-		[]string{expectedGreen, expectedGreen, expectedBlue})
-
-	logger.Info("Updating the Service Spec with a new image")
-	if _, err := test.UpdateServiceImage(clients, svc, releaseImagePath3); err != nil {
-		t.Fatalf("Patch update for Service %s with new image %s failed: %v", names.Service, releaseImagePath3, err)
+	desiredTrafficShape = map[string]v1alpha1.TrafficTarget{
+		v1alpha1.CurrentTrafficTarget: {
+			Name:         v1alpha1.CurrentTrafficTarget,
+			RevisionName: revisions[0],
+			Percent:      50,
+		},
+		v1alpha1.CandidateTrafficTarget: {
+			Name:         v1alpha1.CandidateTrafficTarget,
+			RevisionName: revisions[1],
+			Percent:      50,
+		},
+		v1alpha1.LatestTrafficTarget: {
+			Name:         v1alpha1.LatestTrafficTarget,
+			RevisionName: revisions[1],
+		},
+	}
+	t.Log("Waiting for Service to become ready with the new shape.")
+	if err := waitForDesiredTrafficShape(t, names.Service, desiredTrafficShape, clients); err != nil {
+		t.Fatal("Service never obtained expected shape")
 	}
 
-	logger.Info("Traffic should remain between the two images, and the new revision should be available on the named traffic target 'latest'")
-	validateDomains(t, logger, clients,
-		routeDomain,
-		[]string{expectedBlue, expectedGreen},
-		[]string{"latest", "candidate", "current"},
-		[]string{expectedLatest, expectedGreen, expectedBlue})
+	t.Log("Traffic should be split between the two revisions and available on three named traffic targets, 'current', 'candidate', and 'latest'")
+	if err := validateDomains(t, clients,
+		names.Domain,
+		[]string{expectedFirstRev, expectedSecondRev},
+		[]string{v1alpha1.CandidateTrafficTarget, v1alpha1.LatestTrafficTarget, v1alpha1.CurrentTrafficTarget},
+		[]string{expectedSecondRev, expectedSecondRev, expectedFirstRev}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4. Two Revisions Specified, 50% rollout, candidate != latest.
+	t.Log("4. Updating the Service Spec with a new image")
+	if _, err := test.PatchServiceImage(t, clients, objects.Service, releaseImagePath3); err != nil {
+		t.Fatalf("Patch update for Service %s with new image %s failed: %v", names.Service, releaseImagePath3, err)
+	}
+	t.Log("Since the Service was updated a new Revision will be created")
+	if names.Revision, err = test.WaitForServiceLatestRevision(clients, names); err != nil {
+		t.Fatalf("The Service %s was not updated with new revision %s: %v", names.Service, names.Revision, err)
+	}
+
+	desiredTrafficShape[v1alpha1.LatestTrafficTarget] = v1alpha1.TrafficTarget{
+		Name:         v1alpha1.LatestTrafficTarget,
+		RevisionName: names.Revision,
+	}
+	t.Log("Waiting for Service to become ready with the new shape.")
+	if err := waitForDesiredTrafficShape(t, names.Service, desiredTrafficShape, clients); err != nil {
+		t.Fatal("Service never obtained expected shape")
+	}
+
+	t.Log("Traffic should remain between the two images, and the new revision should be available on the named traffic target 'latest'")
+	if err := validateDomains(t, clients,
+		names.Domain,
+		[]string{expectedFirstRev, expectedSecondRev},
+		[]string{v1alpha1.LatestTrafficTarget, v1alpha1.CandidateTrafficTarget, v1alpha1.CurrentTrafficTarget},
+		[]string{expectedThirdRev, expectedSecondRev, expectedFirstRev}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now update the service to use `@latest` as candidate.
+	revisions[1] = v1alpha1.ReleaseLatestRevisionKeyword
+	t.Log("5. Updating Service to split traffic between two `current` and `@latest`")
+	if objects.Service, err = test.PatchReleaseService(t, clients, objects.Service, revisions, 50); err != nil {
+		t.Fatalf("Service %s was not updated to release: %v", names.Service, err)
+	}
+	// Verify in the end it's still the case.
+	if err := validateAnnotations(objects); err != nil {
+		t.Errorf("Service annotations are incorrect: %v", err)
+	}
+
+	// `candidate` now points to the latest.
+	desiredTrafficShape[v1alpha1.CandidateTrafficTarget] = v1alpha1.TrafficTarget{
+		Name:         v1alpha1.CandidateTrafficTarget,
+		RevisionName: names.Revision,
+		Percent:      50,
+	}
+	t.Log("Waiting for Service to become ready with the new shape.")
+	if err := waitForDesiredTrafficShape(t, names.Service, desiredTrafficShape, clients); err != nil {
+		t.Fatal("Service never obtained expected shape")
+	}
+
+	if err := validateDomains(t, clients,
+		names.Domain,
+		[]string{expectedFirstRev, expectedThirdRev},
+		[]string{v1alpha1.LatestTrafficTarget, v1alpha1.CandidateTrafficTarget, v1alpha1.CurrentTrafficTarget},
+		[]string{expectedThirdRev, expectedThirdRev, expectedFirstRev}); err != nil {
+		t.Fatal(err)
+	}
 }
 
-// TODO(jonjohnsonjr): LatestService roads less traveled.
-// TODO(jonjohnsonjr): PinnedService happy path.
-// TODO(jonjohnsonjr): PinnedService roads less traveled.
 // TODO(jonjohnsonjr): Examples of deploying from source.

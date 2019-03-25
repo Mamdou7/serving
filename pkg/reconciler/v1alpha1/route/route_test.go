@@ -24,27 +24,26 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/google/go-cmp/cmp/cmpopts"
 	duckv1alpha1 "github.com/knative/pkg/apis/duck/v1alpha1"
-	"github.com/knative/pkg/apis/istio/v1alpha3"
 	"github.com/knative/pkg/configmap"
 	ctrl "github.com/knative/pkg/controller"
-	"github.com/knative/serving/pkg/activator"
+	"github.com/knative/pkg/system"
 	netv1alpha1 "github.com/knative/serving/pkg/apis/networking/v1alpha1"
 	"github.com/knative/serving/pkg/apis/serving"
 	"github.com/knative/serving/pkg/apis/serving/v1alpha1"
 	fakeclientset "github.com/knative/serving/pkg/client/clientset/versioned/fake"
 	informers "github.com/knative/serving/pkg/client/informers/externalversions"
 	"github.com/knative/serving/pkg/gc"
+	"github.com/knative/serving/pkg/network"
 	rclr "github.com/knative/serving/pkg/reconciler"
 	"github.com/knative/serving/pkg/reconciler/v1alpha1/route/config"
 	. "github.com/knative/serving/pkg/reconciler/v1alpha1/testing"
-	"github.com/knative/serving/pkg/system"
+	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/apimachinery/pkg/watch"
 	kubeinformers "k8s.io/client-go/informers"
 	fakekubeclientset "k8s.io/client-go/kubernetes/fake"
 )
@@ -93,7 +92,9 @@ func getTestRevisionWithCondition(name string, cond duckv1alpha1.Condition) *v1a
 		},
 		Status: v1alpha1.RevisionStatus{
 			ServiceName: fmt.Sprintf("%s-service", name),
-			Conditions:  duckv1alpha1.Conditions{cond},
+			Status: duckv1alpha1.Status{
+				Conditions: duckv1alpha1.Conditions{cond},
+			},
 		},
 	}
 }
@@ -107,7 +108,7 @@ func getTestConfiguration() *v1alpha1.Configuration {
 		},
 		Spec: v1alpha1.ConfigurationSpec{
 			// This is a workaround for generation initialization
-			Generation: 1,
+			DeprecatedGeneration: 1,
 			RevisionTemplate: v1alpha1.RevisionTemplateSpec{
 				Spec: v1alpha1.RevisionSpec{
 					Container: corev1.Container{
@@ -139,18 +140,6 @@ func getTestRevisionForConfig(config *v1alpha1.Configuration) *v1alpha1.Revision
 	return rev
 }
 
-func getActivatorDestinationWeight(w int) v1alpha3.DestinationWeight {
-	return v1alpha3.DestinationWeight{
-		Destination: v1alpha3.Destination{
-			Host: rclr.GetK8sServiceFullname(activator.K8sServiceName, system.Namespace),
-			Port: v1alpha3.PortSelector{
-				Number: 80,
-			},
-		},
-		Weight: w,
-	}
-}
-
 func newTestReconciler(t *testing.T, configs ...*corev1.ConfigMap) (
 	kubeClient *fakekubeclientset.Clientset,
 	servingClient *fakeclientset.Clientset,
@@ -173,30 +162,31 @@ func newTestSetup(t *testing.T, configs ...*corev1.ConfigMap) (
 
 	// Create fake clients
 	kubeClient = fakekubeclientset.NewSimpleClientset()
-	cms := []*corev1.ConfigMap{
-		{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      config.DomainConfigName,
-				Namespace: system.Namespace,
-			},
-			Data: map[string]string{
-				defaultDomainSuffix: "",
-				prodDomainSuffix:    "selector:\n  app: prod",
-			},
+	cms := []*corev1.ConfigMap{{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      config.DomainConfigName,
+			Namespace: system.Namespace(),
 		},
-		{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      gc.ConfigName,
-				Namespace: system.Namespace,
-			},
-			Data: map[string]string{},
+		Data: map[string]string{
+			defaultDomainSuffix: "",
+			prodDomainSuffix:    "selector:\n  app: prod",
 		},
-	}
-	for _, cm := range configs {
-		cms = append(cms, cm)
-	}
+	}, {
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      network.ConfigName,
+			Namespace: system.Namespace(),
+		},
+		Data: map[string]string{},
+	}, {
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      gc.ConfigName,
+			Namespace: system.Namespace(),
+		},
+		Data: map[string]string{},
+	}}
+	cms = append(cms, configs...)
 
-	configMapWatcher = &configmap.ManualWatcher{Namespace: system.Namespace}
+	configMapWatcher = &configmap.ManualWatcher{Namespace: system.Namespace()}
 	servingClient = fakeclientset.NewSimpleClientset()
 
 	// Create informer factories with fake clients. The second parameter sets the
@@ -274,11 +264,9 @@ func TestCreateRouteForOneReserveRevision(t *testing.T) {
 	h.OnCreate(&kubeClient.Fake, "events", ExpectNormalEventDelivery(t, "^Created ClusterIngress.*" /*ingress name is unset in test*/))
 
 	// An inactive revision
-	rev := getTestRevisionWithCondition("test-rev",
-		duckv1alpha1.Condition{
-			Type:   v1alpha1.RevisionConditionActive,
-			Status: corev1.ConditionFalse,
-		})
+	rev := getTestRevision("test-rev")
+	rev.Status.MarkInactive("NoTraffic", "no message")
+
 	servingClient.ServingV1alpha1().Revisions(testNamespace).Create(rev)
 	servingInformer.Serving().V1alpha1().Revisions().Informer().GetIndexer().Add(rev)
 
@@ -294,7 +282,7 @@ func TestCreateRouteForOneReserveRevision(t *testing.T) {
 	// Since Reconcile looks in the lister, we need to add it to the informer
 	servingInformer.Serving().V1alpha1().Routes().Informer().GetIndexer().Add(route)
 
-	controller.Reconcile(context.TODO(), KeyOrDie(route))
+	controller.Reconcile(context.Background(), KeyOrDie(route))
 
 	ci := getRouteIngressFromClient(t, servingClient, route)
 
@@ -307,30 +295,19 @@ func TestCreateRouteForOneReserveRevision(t *testing.T) {
 		t.Errorf("Unexpected label diff (-want +got): %v", diff)
 	}
 
-	// Check owner refs
-	expectedRefs := []metav1.OwnerReference{{
-		APIVersion: "serving.knative.dev/v1alpha1",
-		Kind:       "Route",
-		Name:       route.Name,
-	}}
-
-	if diff := cmp.Diff(expectedRefs, ci.OwnerReferences, cmpopts.IgnoreFields(expectedRefs[0], "Controller", "BlockOwnerDeletion")); diff != "" {
-		t.Errorf("Unexpected rule owner refs diff (-want +got): %v", diff)
-	}
 	domain := strings.Join([]string{route.Name, route.Namespace, defaultDomainSuffix}, ".")
 	expectedSpec := netv1alpha1.IngressSpec{
+		Visibility: netv1alpha1.IngressVisibilityExternalIP,
 		Rules: []netv1alpha1.ClusterIngressRule{{
 			Hosts: []string{
 				domain,
 				"test-route.test.svc.cluster.local",
-				"test-route.test.svc",
-				"test-route.test",
 			},
 			HTTP: &netv1alpha1.HTTPClusterIngressRuleValue{
 				Paths: []netv1alpha1.HTTPClusterIngressPath{{
 					Splits: []netv1alpha1.ClusterIngressBackendSplit{{
 						ClusterIngressBackend: netv1alpha1.ClusterIngressBackend{
-							ServiceNamespace: "knative-serving",
+							ServiceNamespace: system.Namespace(),
 							ServiceName:      "activator-service",
 							ServicePort:      intstr.FromInt(80),
 						},
@@ -339,11 +316,6 @@ func TestCreateRouteForOneReserveRevision(t *testing.T) {
 					AppendHeaders: map[string]string{
 						"knative-serving-revision":  "test-rev",
 						"knative-serving-namespace": testNamespace,
-					},
-					Timeout: &metav1.Duration{Duration: netv1alpha1.DefaultTimeout},
-					Retries: &netv1alpha1.HTTPRetry{
-						PerTryTimeout: &metav1.Duration{Duration: netv1alpha1.DefaultTimeout},
-						Attempts:      netv1alpha1.DefaultRetryCount,
 					},
 				}},
 			},
@@ -362,7 +334,7 @@ func TestCreateRouteForOneReserveRevision(t *testing.T) {
 		},
 	}
 	servingInformer.Networking().V1alpha1().ClusterIngresses().Informer().GetIndexer().Update(ci)
-	controller.Reconcile(context.TODO(), KeyOrDie(route))
+	controller.Reconcile(context.Background(), KeyOrDie(route))
 
 	if err := h.WaitForHooks(time.Second * 3); err != nil {
 		t.Error(err)
@@ -402,17 +374,16 @@ func TestCreateRouteWithMultipleTargets(t *testing.T) {
 	// Since Reconcile looks in the lister, we need to add it to the informer
 	servingInformer.Serving().V1alpha1().Routes().Informer().GetIndexer().Add(route)
 
-	controller.Reconcile(context.TODO(), KeyOrDie(route))
+	controller.Reconcile(context.Background(), KeyOrDie(route))
 
 	ci := getRouteIngressFromClient(t, servingClient, route)
 	domain := strings.Join([]string{route.Name, route.Namespace, defaultDomainSuffix}, ".")
 	expectedSpec := netv1alpha1.IngressSpec{
+		Visibility: netv1alpha1.IngressVisibilityExternalIP,
 		Rules: []netv1alpha1.ClusterIngressRule{{
 			Hosts: []string{
 				domain,
 				"test-route.test.svc.cluster.local",
-				"test-route.test.svc",
-				"test-route.test",
 			},
 			HTTP: &netv1alpha1.HTTPClusterIngressRuleValue{
 				Paths: []netv1alpha1.HTTPClusterIngressPath{{
@@ -431,11 +402,6 @@ func TestCreateRouteWithMultipleTargets(t *testing.T) {
 						},
 						Percent: 10,
 					}},
-					Timeout: &metav1.Duration{Duration: netv1alpha1.DefaultTimeout},
-					Retries: &netv1alpha1.HTTPRetry{
-						PerTryTimeout: &metav1.Duration{Duration: netv1alpha1.DefaultTimeout},
-						Attempts:      netv1alpha1.DefaultRetryCount,
-					},
 				}},
 			},
 		}},
@@ -449,11 +415,9 @@ func TestCreateRouteWithMultipleTargets(t *testing.T) {
 func TestCreateRouteWithOneTargetReserve(t *testing.T) {
 	_, servingClient, controller, _, servingInformer, _ := newTestReconciler(t)
 	// A standalone inactive revision
-	rev := getTestRevisionWithCondition("test-rev",
-		duckv1alpha1.Condition{
-			Type:   v1alpha1.RevisionConditionActive,
-			Status: corev1.ConditionFalse,
-		})
+	rev := getTestRevision("test-rev")
+	rev.Status.MarkInactive("NoTraffic", "no message")
+
 	servingClient.ServingV1alpha1().Revisions(testNamespace).Create(rev)
 	servingInformer.Serving().V1alpha1().Revisions().Informer().GetIndexer().Add(rev)
 
@@ -484,17 +448,16 @@ func TestCreateRouteWithOneTargetReserve(t *testing.T) {
 	// Since Reconcile looks in the lister, we need to add it to the informer
 	servingInformer.Serving().V1alpha1().Routes().Informer().GetIndexer().Add(route)
 
-	controller.Reconcile(context.TODO(), KeyOrDie(route))
+	controller.Reconcile(context.Background(), KeyOrDie(route))
 
 	ci := getRouteIngressFromClient(t, servingClient, route)
 	domain := strings.Join([]string{route.Name, route.Namespace, defaultDomainSuffix}, ".")
 	expectedSpec := netv1alpha1.IngressSpec{
+		Visibility: netv1alpha1.IngressVisibilityExternalIP,
 		Rules: []netv1alpha1.ClusterIngressRule{{
 			Hosts: []string{
 				domain,
 				"test-route.test.svc.cluster.local",
-				"test-route.test.svc",
-				"test-route.test",
 			},
 			HTTP: &netv1alpha1.HTTPClusterIngressRuleValue{
 				Paths: []netv1alpha1.HTTPClusterIngressPath{{
@@ -507,7 +470,7 @@ func TestCreateRouteWithOneTargetReserve(t *testing.T) {
 						Percent: 90,
 					}, {
 						ClusterIngressBackend: netv1alpha1.ClusterIngressBackend{
-							ServiceNamespace: "knative-serving",
+							ServiceNamespace: system.Namespace(),
 							ServiceName:      "activator-service",
 							ServicePort:      intstr.FromInt(80),
 						},
@@ -516,11 +479,6 @@ func TestCreateRouteWithOneTargetReserve(t *testing.T) {
 					AppendHeaders: map[string]string{
 						"knative-serving-revision":  "test-rev",
 						"knative-serving-namespace": testNamespace,
-					},
-					Timeout: &metav1.Duration{Duration: netv1alpha1.DefaultTimeout},
-					Retries: &netv1alpha1.HTTPRetry{
-						PerTryTimeout: &metav1.Duration{Duration: netv1alpha1.DefaultTimeout},
-						Attempts:      netv1alpha1.DefaultRetryCount,
 					},
 				}},
 			},
@@ -583,17 +541,16 @@ func TestCreateRouteWithDuplicateTargets(t *testing.T) {
 	// Since Reconcile looks in the lister, we need to add it to the informer
 	servingInformer.Serving().V1alpha1().Routes().Informer().GetIndexer().Add(route)
 
-	controller.Reconcile(context.TODO(), KeyOrDie(route))
+	controller.Reconcile(context.Background(), KeyOrDie(route))
 
 	ci := getRouteIngressFromClient(t, servingClient, route)
 	domain := strings.Join([]string{route.Name, route.Namespace, defaultDomainSuffix}, ".")
 	expectedSpec := netv1alpha1.IngressSpec{
+		Visibility: netv1alpha1.IngressVisibilityExternalIP,
 		Rules: []netv1alpha1.ClusterIngressRule{{
 			Hosts: []string{
 				domain,
 				"test-route.test.svc.cluster.local",
-				"test-route.test.svc",
-				"test-route.test",
 			},
 			HTTP: &netv1alpha1.HTTPClusterIngressRuleValue{
 				Paths: []netv1alpha1.HTTPClusterIngressPath{{
@@ -612,11 +569,6 @@ func TestCreateRouteWithDuplicateTargets(t *testing.T) {
 						},
 						Percent: 50,
 					}},
-					Timeout: &metav1.Duration{Duration: netv1alpha1.DefaultTimeout},
-					Retries: &netv1alpha1.HTTPRetry{
-						PerTryTimeout: &metav1.Duration{Duration: netv1alpha1.DefaultTimeout},
-						Attempts:      netv1alpha1.DefaultRetryCount,
-					},
 				}},
 			},
 		}, {
@@ -631,11 +583,6 @@ func TestCreateRouteWithDuplicateTargets(t *testing.T) {
 						},
 						Percent: 100,
 					}},
-					Timeout: &metav1.Duration{Duration: netv1alpha1.DefaultTimeout},
-					Retries: &netv1alpha1.HTTPRetry{
-						PerTryTimeout: &metav1.Duration{Duration: netv1alpha1.DefaultTimeout},
-						Attempts:      netv1alpha1.DefaultRetryCount,
-					},
 				}},
 			},
 		}, {
@@ -650,11 +597,6 @@ func TestCreateRouteWithDuplicateTargets(t *testing.T) {
 						},
 						Percent: 100,
 					}},
-					Timeout: &metav1.Duration{Duration: netv1alpha1.DefaultTimeout},
-					Retries: &netv1alpha1.HTTPRetry{
-						PerTryTimeout: &metav1.Duration{Duration: netv1alpha1.DefaultTimeout},
-						Attempts:      netv1alpha1.DefaultRetryCount,
-					},
 				}},
 			},
 		}},
@@ -702,17 +644,16 @@ func TestCreateRouteWithNamedTargets(t *testing.T) {
 	// Since Reconcile looks in the lister, we need to add it to the informer
 	servingInformer.Serving().V1alpha1().Routes().Informer().GetIndexer().Add(route)
 
-	controller.Reconcile(context.TODO(), KeyOrDie(route))
+	controller.Reconcile(context.Background(), KeyOrDie(route))
 
 	ci := getRouteIngressFromClient(t, servingClient, route)
 	domain := strings.Join([]string{route.Name, route.Namespace, defaultDomainSuffix}, ".")
 	expectedSpec := netv1alpha1.IngressSpec{
+		Visibility: netv1alpha1.IngressVisibilityExternalIP,
 		Rules: []netv1alpha1.ClusterIngressRule{{
 			Hosts: []string{
 				domain,
 				"test-route.test.svc.cluster.local",
-				"test-route.test.svc",
-				"test-route.test",
 			},
 			HTTP: &netv1alpha1.HTTPClusterIngressRuleValue{
 				Paths: []netv1alpha1.HTTPClusterIngressPath{{
@@ -731,11 +672,6 @@ func TestCreateRouteWithNamedTargets(t *testing.T) {
 						},
 						Percent: 50,
 					}},
-					Timeout: &metav1.Duration{Duration: netv1alpha1.DefaultTimeout},
-					Retries: &netv1alpha1.HTTPRetry{
-						PerTryTimeout: &metav1.Duration{Duration: netv1alpha1.DefaultTimeout},
-						Attempts:      netv1alpha1.DefaultRetryCount,
-					},
 				}},
 			},
 		}, {
@@ -750,11 +686,6 @@ func TestCreateRouteWithNamedTargets(t *testing.T) {
 						},
 						Percent: 100,
 					}},
-					Timeout: &metav1.Duration{Duration: netv1alpha1.DefaultTimeout},
-					Retries: &netv1alpha1.HTTPRetry{
-						PerTryTimeout: &metav1.Duration{Duration: netv1alpha1.DefaultTimeout},
-						Attempts:      netv1alpha1.DefaultRetryCount,
-					},
 				}},
 			},
 		}, {
@@ -769,11 +700,6 @@ func TestCreateRouteWithNamedTargets(t *testing.T) {
 						},
 						Percent: 100,
 					}},
-					Timeout: &metav1.Duration{Duration: netv1alpha1.DefaultTimeout},
-					Retries: &netv1alpha1.HTTPRetry{
-						PerTryTimeout: &metav1.Duration{Duration: netv1alpha1.DefaultTimeout},
-						Attempts:      netv1alpha1.DefaultRetryCount,
-					},
 				}},
 			},
 		}},
@@ -792,7 +718,7 @@ func TestUpdateDomainConfigMap(t *testing.T) {
 	// Create a route.
 	servingInformer.Serving().V1alpha1().Routes().Informer().GetIndexer().Add(route)
 	routeClient.Create(route)
-	controller.Reconcile(context.TODO(), KeyOrDie(route))
+	controller.Reconcile(context.Background(), KeyOrDie(route))
 	addResourcesToInformers(t, servingClient, servingInformer, route)
 
 	route.ObjectMeta.Labels = map[string]string{"app": "prod"}
@@ -810,7 +736,7 @@ func TestUpdateDomainConfigMap(t *testing.T) {
 			domainConfig := corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      config.DomainConfigName,
-					Namespace: system.Namespace,
+					Namespace: system.Namespace(),
 				},
 				Data: map[string]string{
 					defaultDomainSuffix: "",
@@ -825,7 +751,7 @@ func TestUpdateDomainConfigMap(t *testing.T) {
 			domainConfig := corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      config.DomainConfigName,
-					Namespace: system.Namespace,
+					Namespace: system.Namespace(),
 				},
 				Data: map[string]string{
 					"newdefault.net":   "",
@@ -836,13 +762,14 @@ func TestUpdateDomainConfigMap(t *testing.T) {
 			route.Labels = make(map[string]string)
 		},
 	}, {
-		// An invalid config map
-		expectedDomainSuffix: "newdefault.net",
+		// When no domain with an open selector is specified, we fallback
+		// on the default of example.com.
+		expectedDomainSuffix: config.DefaultDomain,
 		apply: func() {
 			domainConfig := corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      config.DomainConfigName,
-					Namespace: system.Namespace,
+					Namespace: system.Namespace(),
 				},
 				Data: map[string]string{
 					"mytestdomain.com": "selector:\n  app: prod",
@@ -852,75 +779,41 @@ func TestUpdateDomainConfigMap(t *testing.T) {
 			route.Labels = make(map[string]string)
 		},
 	}}
-	for _, expectation := range expectations {
-		expectation.apply()
-		servingInformer.Serving().V1alpha1().Routes().Informer().GetIndexer().Add(route)
-		routeClient.Update(route)
-		controller.Reconcile(context.TODO(), KeyOrDie(route))
-		addResourcesToInformers(t, servingClient, servingInformer, route)
 
-		route, _ = routeClient.Get(route.Name, metav1.GetOptions{})
-		expectedDomain := fmt.Sprintf("%s.%s.%s", route.Name, route.Namespace, expectation.expectedDomainSuffix)
-		if route.Status.Domain != expectedDomain {
-			t.Errorf("Expected domain %q but saw %q", expectedDomain, route.Status.Domain)
-		}
+	for _, expectation := range expectations {
+		t.Run(expectation.expectedDomainSuffix, func(t *testing.T) {
+			expectation.apply()
+			servingInformer.Serving().V1alpha1().Routes().Informer().GetIndexer().Add(route)
+			routeClient.Update(route)
+			controller.Reconcile(context.Background(), KeyOrDie(route))
+			addResourcesToInformers(t, servingClient, servingInformer, route)
+
+			route, _ = routeClient.Get(route.Name, metav1.GetOptions{})
+			expectedDomain := fmt.Sprintf("%s.%s.%s", route.Name, route.Namespace, expectation.expectedDomainSuffix)
+			if route.Status.Domain != expectedDomain {
+				t.Errorf("Expected domain %q but saw %q", expectedDomain, route.Status.Domain)
+			}
+		})
 	}
 }
 
 func TestGlobalResyncOnUpdateDomainConfigMap(t *testing.T) {
-	_, servingClient, controller, _, kubeInformer, servingInformer, watcher := newTestSetup(t)
-
-	stopCh := make(chan struct{})
-	defer func() {
-		close(stopCh)
-	}()
-
-	servingInformer.Start(stopCh)
-	kubeInformer.Start(stopCh)
-	if err := watcher.Start(stopCh); err != nil {
-		t.Fatalf("failed to start configuration manager: %v", err)
-	}
-
-	go controller.Run(1, stopCh)
-
-	route := getTestRouteWithTrafficTargets([]v1alpha1.TrafficTarget{})
-	routeClient := servingClient.ServingV1alpha1().Routes(route.Namespace)
-	routeWatcher, err := routeClient.Watch(metav1.ListOptions{})
-	if err != nil {
-		t.Fatalf("Could not create route watcher")
-	}
-	defer routeWatcher.Stop()
-
-	routeModifiedCh := make(chan struct{})
-	defer close(routeModifiedCh)
-
-	go func() {
-		for event := range routeWatcher.ResultChan() {
-			if event.Type == watch.Modified {
-				routeModifiedCh <- struct{}{}
-			}
-		}
-	}()
-
-	// Create a route.
-	route.Labels = map[string]string{"app": "prod"}
-	routeClient.Create(route)
-
+	defer ClearAllLoggers()
 	// Test changes in domain config map. Routes should get updated appropriately.
 	// We're expecting exactly one route modification per config-map change.
 	tests := []struct {
-		doThings             func()
+		doThings             func(*configmap.ManualWatcher)
 		expectedDomainSuffix string
 	}{{
 		expectedDomainSuffix: prodDomainSuffix,
-		doThings:             func() {}, // The update will still happen: status will be updated to match the route labels
+		doThings:             func(*configmap.ManualWatcher) {}, // The update will still happen: status will be updated to match the route labels
 	}, {
 		expectedDomainSuffix: "mytestdomain.com",
-		doThings: func() {
+		doThings: func(watcher *configmap.ManualWatcher) {
 			domainConfig := corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      config.DomainConfigName,
-					Namespace: system.Namespace,
+					Namespace: system.Namespace(),
 				},
 				Data: map[string]string{
 					defaultDomainSuffix: "",
@@ -931,11 +824,11 @@ func TestGlobalResyncOnUpdateDomainConfigMap(t *testing.T) {
 		},
 	}, {
 		expectedDomainSuffix: "newprod.net",
-		doThings: func() {
+		doThings: func(watcher *configmap.ManualWatcher) {
 			domainConfig := corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      config.DomainConfigName,
-					Namespace: system.Namespace,
+					Namespace: system.Namespace(),
 				},
 				Data: map[string]string{
 					defaultDomainSuffix: "",
@@ -946,11 +839,11 @@ func TestGlobalResyncOnUpdateDomainConfigMap(t *testing.T) {
 		},
 	}, {
 		expectedDomainSuffix: defaultDomainSuffix,
-		doThings: func() {
+		doThings: func(watcher *configmap.ManualWatcher) {
 			domainConfig := corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      config.DomainConfigName,
-					Namespace: system.Namespace,
+					Namespace: system.Namespace(),
 				},
 				Data: map[string]string{
 					defaultDomainSuffix: "",
@@ -959,24 +852,129 @@ func TestGlobalResyncOnUpdateDomainConfigMap(t *testing.T) {
 			watcher.OnChange(&domainConfig)
 		},
 	}}
+
 	for _, test := range tests {
+		test := test
 		t.Run(test.expectedDomainSuffix, func(t *testing.T) {
-			test.doThings()
+			_, servingClient, controller, _, kubeInformer, servingInformer, watcher := newTestSetup(t)
 
-			select {
-			case <-routeModifiedCh:
-			case <-time.NewTimer(10 * time.Second).C:
-				t.Logf("routeWatcher did not receive a Type==Modified event for %s in 10s", test.expectedDomainSuffix)
+			stopCh := make(chan struct{})
+			grp := errgroup.Group{}
+			defer func() {
+				close(stopCh)
+				if err := grp.Wait(); err != nil {
+					t.Errorf("Wait() = %v", err)
+				}
+			}()
+			h := NewHooks()
+
+			// Check for ClusterIngress created as a signal that syncHandler ran
+			h.OnUpdate(&servingClient.Fake, "routes", func(obj runtime.Object) HookResult {
+				rt := obj.(*v1alpha1.Route)
+				t.Logf("route updated: %q", rt.Name)
+
+				expectedDomain := fmt.Sprintf("%s.%s.%s", rt.Name, rt.Namespace, test.expectedDomainSuffix)
+				if rt.Status.Domain != expectedDomain {
+					t.Logf("Expected domain %q but saw %q", expectedDomain, rt.Status.Domain)
+					return HookIncomplete
+				}
+
+				return HookComplete
+			})
+
+			servingInformer.Start(stopCh)
+			kubeInformer.Start(stopCh)
+
+			servingInformer.WaitForCacheSync(stopCh)
+			kubeInformer.WaitForCacheSync(stopCh)
+
+			if err := watcher.Start(stopCh); err != nil {
+				t.Fatalf("failed to start configuration manager: %v", err)
 			}
 
-			route, err := routeClient.Get(route.Name, metav1.GetOptions{})
-			if err != nil {
-				t.Fatalf("Error getting a route, test: '%s'", test.expectedDomainSuffix)
-			}
-			expectedDomain := fmt.Sprintf("%s.%s.%s", route.Name, route.Namespace, test.expectedDomainSuffix)
-			if route.Status.Domain != expectedDomain {
-				t.Errorf("Expected domain %q but saw %q", expectedDomain, route.Status.Domain)
+			grp.Go(func() error { return controller.Run(1, stopCh) })
+
+			// Create a route.
+			route := getTestRouteWithTrafficTargets([]v1alpha1.TrafficTarget{})
+			route.Labels = map[string]string{"app": "prod"}
+
+			servingClient.ServingV1alpha1().Routes(route.Namespace).Create(route)
+
+			test.doThings(watcher)
+
+			if err := h.WaitForHooks(3 * time.Second); err != nil {
+				t.Error(err)
 			}
 		})
+	}
+}
+
+func TestRouteDomain(t *testing.T) {
+	route := &v1alpha1.Route{
+		ObjectMeta: metav1.ObjectMeta{
+			SelfLink:  "/apis/serving/v1alpha1/namespaces/test/Routes/myapp",
+			Name:      "myapp",
+			Namespace: "default",
+			Labels: map[string]string{
+				"route": "myapp",
+			},
+		},
+	}
+
+	context := context.Background()
+	cfg := ReconcilerTestConfig()
+	context = config.ToContext(context, cfg)
+
+	tests := []struct {
+		Name     string
+		Template string
+		Pass     bool
+		Expected string
+	}{
+		{"Default",
+			"{{.Name}}.{{.Namespace}}.{{.Domain}}",
+			true,
+			"myapp.default.example.com",
+		},
+		{"Dash",
+			"{{.Name}}-{{.Namespace}}.{{.Domain}}",
+			true,
+			"myapp-default.example.com",
+		},
+		{"Short",
+			"{{.Name}}.{{.Domain}}",
+			true,
+			"myapp.example.com",
+		},
+		{"SuperShort",
+			"{{.Name}}",
+			true,
+			"myapp",
+		},
+		{"SyntaxError",
+			"{{.Name{}}.{{.Namespace}}.{{.Domain}}",
+			false,
+			"",
+		},
+		{"BadVarName",
+			"{{.Name}}.{{.NNNamespace}}.{{.Domain}}",
+			false,
+			"",
+		},
+	}
+
+	for _, test := range tests {
+		cfg.Network.DomainTemplate = test.Template
+
+		res, err := routeDomain(context, route)
+
+		if test.Pass != (err == nil) {
+			t.Fatalf("TestRouteDomain %q test: supposed to fail but didn't",
+				test.Name)
+		}
+		if res != test.Expected {
+			t.Fatalf("TestRouteDomain %q test: got: %q exp: %q",
+				test.Name, res, test.Expected)
+		}
 	}
 }

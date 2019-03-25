@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
@@ -168,5 +168,35 @@ func TestMultiUpdate(t *testing.T) {
 
 	if updates != 2 {
 		t.Errorf("Unexpected number of Update events; want 2, got %d", updates)
+	}
+}
+
+func TestWaitNoExecutionAfterWait(t *testing.T) {
+	h := NewHooks()
+	f := fake.NewSimpleClientset()
+
+	createCalled := false
+	h.OnCreate(&f.Fake, "pods", func(obj runtime.Object) HookResult {
+		createCalled = true
+		return true
+	})
+
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-pod",
+		},
+		Spec: v1.PodSpec{
+			RestartPolicy: v1.RestartPolicyAlways,
+		},
+	}
+	err := h.WaitForHooks(time.Millisecond)
+
+	f.CoreV1().Pods("test").Create(pod)
+
+	if err == nil {
+		t.Error("expected uncalled hook to cause a timeout error")
+	}
+	if createCalled == true {
+		t.Error("expected create hook not to be called")
 	}
 }

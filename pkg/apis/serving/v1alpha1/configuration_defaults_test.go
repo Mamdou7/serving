@@ -17,11 +17,10 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"context"
 	"testing"
-	"time"
 
 	"github.com/google/go-cmp/cmp"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestConfigurationDefaulting(t *testing.T) {
@@ -36,9 +35,7 @@ func TestConfigurationDefaulting(t *testing.T) {
 			Spec: ConfigurationSpec{
 				RevisionTemplate: RevisionTemplateSpec{
 					Spec: RevisionSpec{
-						TimeoutSeconds: &metav1.Duration{
-							Duration: 60 * time.Second,
-						},
+						TimeoutSeconds: defaultTimeoutSeconds,
 					},
 				},
 			},
@@ -50,9 +47,7 @@ func TestConfigurationDefaulting(t *testing.T) {
 				RevisionTemplate: RevisionTemplateSpec{
 					Spec: RevisionSpec{
 						ContainerConcurrency: 1,
-						TimeoutSeconds: &metav1.Duration{
-							Duration: 99 * time.Second,
-						},
+						TimeoutSeconds:       99,
 					},
 				},
 			},
@@ -62,9 +57,7 @@ func TestConfigurationDefaulting(t *testing.T) {
 				RevisionTemplate: RevisionTemplateSpec{
 					Spec: RevisionSpec{
 						ContainerConcurrency: 1,
-						TimeoutSeconds: &metav1.Duration{
-							Duration: 99 * time.Second,
-						},
+						TimeoutSeconds:       99,
 					},
 				},
 			},
@@ -74,7 +67,7 @@ func TestConfigurationDefaulting(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got := test.in
-			got.SetDefaults()
+			got.SetDefaults(context.Background())
 			if diff := cmp.Diff(test.want, got); diff != "" {
 				t.Errorf("SetDefaults (-want, +got) = %v", diff)
 			}
